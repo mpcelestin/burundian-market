@@ -11,6 +11,19 @@
             <div class="card-body">
                 <form method="POST" action="{{ url_for('login') }}">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    
+                    <!-- Flash messages -->
+                    {% with messages = get_flashed_messages(with_categories=true) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+                                    {{ message }}
+                                    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                                </div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
+
                     <div class="mb-3">
                         <label for="identifier" class="form-label">Email or Username</label>
                         <input type="text" class="form-control" id="identifier" name="identifier" required>

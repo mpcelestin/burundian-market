@@ -11,6 +11,8 @@
                 </div>
                 <div class="card-body">
                     <form method="POST" action="{{ url_for('admin_send_message', user_id=user.id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        
                         <div class="mb-3">
                             <label for="subject" class="form-label">Subject</label>
                             <input type="text" class="form-control" id="subject" name="subject" value="Message from Burundian Market Admin" required>

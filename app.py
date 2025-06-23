@@ -32,6 +32,11 @@ db = SQLAlchemy(app)
 mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.secret_key)
 
+@app.before_request
+def before_request():
+    # Make sure we have a clean session for each request
+    session.modified = True
+
 # Database Models
 class User(db.Model):
     __tablename__ = 'users'
@@ -231,8 +236,8 @@ def login():
             flash('Please enter both identifier and password.', 'danger')
             return redirect(url_for('login'))
 
-        # Find user by email or username
-        user = User.query.filter(
+        # Find user by email or username - ensure we're getting a fresh query
+        user = db.session.query(User).filter(
             (User.email == identifier) | (User.username == identifier)
         ).first()
 
@@ -248,9 +253,15 @@ def login():
             flash('Please verify your email before logging in.', 'warning')
             return redirect(url_for('login'))
 
-        # Set session
+        # Clear any existing session
+        session.clear()
+        
+        # Set new session with fresh data
         session['user_id'] = user.id
         session['user_type'] = user.user_type
+        session['username'] = user.username
+        session.permanent = True  # Make session persistent
+        
         flash('Login successful!', 'success')
 
         # Redirect based on role
@@ -343,36 +354,7 @@ def product_detail(product_id):
     
     return render_template('product_detail.html', product=product, seller=seller, is_seller=is_seller)
 
-@app.route('/products/search')
-def product_search():
-    query = request.args.get('q', '')
-    category = request.args.get('category', '')
-    
-    products_query = Product.query
-    
-    if query:
-        products_query = products_query.filter(
-            or_(
-                Product.title.ilike(f'%{query}%'),
-                Product.description.ilike(f'%{query}%')
-            )
-        )
-    
-    if category:
-        products_query = products_query.filter_by(category=category)
-    
-    products = products_query.order_by(Product.created_at.desc()).all()
-    
-    categories = db.session.query(Product.category.distinct()).filter(Product.category.isnot(None)).all()
-    categories = [c[0] for c in categories if c[0]]
-    
-    return render_template(
-        'product_search.html',
-        products=products,
-        search_query=query,
-        categories=categories,
-        selected_category=category
-    )
+
 
 @app.route('/forgot-password', methods=['GET', 'POST'])
 def forgot_password():
@@ -679,8 +661,18 @@ def choose_subscription():
 # Middleware to check seller subscription status
 @app.before_request
 def check_seller_subscription():
-    if 'user_id' in session and session.get('user_type') == 'seller':
+    # Only proceed if user is logged in as a seller
+    if 'user_id' not in session or session.get('user_type') != 'seller':
+        return
+    
+    try:
         user = User.query.get(session['user_id'])
+        
+        # Check if user exists
+        if user is None:
+            session.clear()  # Clear invalid session
+            flash('User not found. Please login again.', 'error')
+            return redirect(url_for('login'))
         
         # If seller's trial period is over (5 days)
         if user.is_seller_active and user.subscription_end is None:
@@ -688,7 +680,7 @@ def check_seller_subscription():
             if datetime.now() > trial_end:
                 user.is_seller_active = False
                 db.session.commit()
-                
+
                 # Notify seller
                 msg = Message('Your Trial Period Has Ended', recipients=[user.email])
                 msg.body = f'''Hello {user.username},
@@ -730,9 +722,14 @@ Seller {user.username} (ID: {user.id}) has only 5 days left in their subscriptio
                 mail.send(msg)
         
         # Redirect to subscription page if not active
-        if not user.is_seller_active and request.endpoint not in ['seller_subscribe', 'choose_subscription', 'logout']:
+        if not user.is_seller_active and request.endpoint not in ['seller_subscribe', 'choose_subscription', 'logout', 'static']:
             flash('Your seller account is not active. Please subscribe to continue.', 'warning')
             return redirect(url_for('seller_subscribe'))
+            
+    except Exception as e:
+        app.logger.error(f"Error in check_seller_subscription: {str(e)}")
+        # Don't interrupt the request flow for minor errors
+        return
 
 if __name__ == '__main__':
     app.run(debug=True)
