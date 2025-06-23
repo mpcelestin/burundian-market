@@ -2,32 +2,35 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
+import datetime
 from sqlalchemy import or_
 from flask_wtf.csrf import CSRFProtect
 from itsdangerous import URLSafeTimedSerializer
 from flask_mail import Mail, Message
 from flask import abort
+from datetime import timedelta
 
 
 app = Flask(__name__)
 csrf = CSRFProtect(app)
 
 # Configuration
-app.secret_key = 'your-secret-key-here-change-this-for-production'
+app.secret_key = os.environ.get('SECRET_KEY', 'default-secret-key-for-dev')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///market.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'mugishapc1@gmail.com'
-app.config['MAIL_PASSWORD'] = 'xxvdufnxrlvmrxwm'
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 app.config['MAIL_DEFAULT_SENDER'] = 'noreply@burundianmarket.com'
-app.config['SECURITY_PASSWORD_SALT'] = 'your-salt-here-change-this'
+app.config['SECURITY_PASSWORD_SALT'] = os.environ.get('SECURITY_PASSWORD_SALT', 'default-salt-for-dev')
+
 
 # Initialize extensions
 db = SQLAlchemy(app)
 mail = Mail(app)
-serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+serializer = URLSafeTimedSerializer(app.secret_key)
 
 # Database Models
 class User(db.Model):
@@ -35,14 +38,20 @@ class User(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(120), nullable=False)  # Removed unique constraint
+    email = db.Column(db.String(120), nullable=False)
     password = db.Column(db.String(200), nullable=False)
     phone = db.Column(db.String(20), nullable=True)
-    user_type = db.Column(db.String(10), nullable=False)
+    user_type = db.Column(db.String(10), nullable=False)  # 'admin', 'seller', 'buyer'
     is_verified = db.Column(db.Boolean, default=False)
     email_verified = db.Column(db.Boolean, default=False)
     verification_token = db.Column(db.String(100), nullable=True)
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    
+    # New fields for seller subscription
+    is_seller_active = db.Column(db.Boolean, default=True)
+    subscription_start = db.Column(db.DateTime, nullable=True)
+    subscription_end = db.Column(db.DateTime, nullable=True)
+    last_payment_proof = db.Column(db.String(200), nullable=True)
     
     def __repr__(self):
         return f'<User {self.username}>'
@@ -68,6 +77,18 @@ class Product(db.Model):
 with app.app_context():
     db.drop_all()  # Drop existing tables
     db.create_all()  # Create new tables with updated schema
+
+    if not User.query.filter_by(email='mugishapc1@gmail.com').first():
+        admin = User(
+            username='TEAM MANAGEMENT',
+            email='mugishapc1@gmail.com',
+            password=generate_password_hash('61Mpc588214#'),
+            user_type='admin',
+            is_verified=True,
+            email_verified=True
+        )
+        db.session.add(admin)
+        db.session.commit()
 
 # Helper Functions
 def send_verification_email(email, token):
@@ -97,9 +118,45 @@ If you did not request a password reset, please ignore this email.
 # Routes
 @app.route('/')
 def home():
-    products = Product.query.order_by(Product.created_at.desc()).limit(8).all()
+    products = Product.query.join(User).filter(
+        User.is_seller_active == True
+    ).order_by(Product.created_at.desc()).limit(8).all()
     return render_template('index.html', products=products)
 
+@app.route('/products/search')
+def product_search():
+    query = request.args.get('q', '')
+    category = request.args.get('category', '')
+    
+    products_query = Product.query.join(User).filter(
+        User.is_seller_active == True
+    )
+    
+    if query:
+        products_query = products_query.filter(
+            or_(
+                Product.title.ilike(f'%{query}%'),
+                Product.description.ilike(f'%{query}%')
+            )
+        )
+    
+    if category:
+        products_query = products_query.filter_by(category=category)
+    
+    products = products_query.order_by(Product.created_at.desc()).all()
+    
+    categories = db.session.query(Product.category.distinct()).filter(Product.category.isnot(None)).all()
+    categories = [c[0] for c in categories if c[0]]
+    
+    return render_template(
+        'product_search.html',
+        products=products,
+        search_query=query,
+        categories=categories,
+        selected_category=category
+    )
+
+# In app.py, update the register route
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
@@ -122,6 +179,11 @@ def register():
             phone=phone,
             user_type=user_type
         )
+        
+        # For sellers, set the trial period
+        if user_type == 'seller':
+            new_user.is_seller_active = True  # Active during trial
+            # subscription_start/end will be null during trial
         
         # Generate verification token
         token = serializer.dumps(email, salt='email-verification')
@@ -162,7 +224,7 @@ def verify_email(token):
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        identifier = request.form.get('identifier')  # Could be email or username
+        identifier = request.form.get('identifier')
         password = request.form.get('password')
 
         if not identifier or not password:
@@ -170,37 +232,34 @@ def login():
             return redirect(url_for('login'))
 
         # Find user by email or username
-        users = User.query.filter((User.email == identifier) | (User.username == identifier)).all()
+        user = User.query.filter(
+            (User.email == identifier) | (User.username == identifier)
+        ).first()
 
-        if not users:
+        if not user:
             flash('No account found with this email or username.', 'danger')
             return redirect(url_for('login'))
 
-        # Check each user's password
-        authenticated_user = None
-        for user in users:
-            if check_password_hash(user.password, password):
-                authenticated_user = user
-                break
-
-        if authenticated_user:
-            if not authenticated_user.email_verified:
-                flash('Please verify your email before logging in.', 'warning')
-                return redirect(url_for('login'))
-
-            # Set session
-            session['user_id'] = authenticated_user.id
-            session['user_type'] = authenticated_user.user_type
-            flash('Login successful!', 'success')
-
-            # Redirect based on role
-            if authenticated_user.user_type == 'seller':
-                return redirect(url_for('seller_dashboard'))
-            else:
-                return redirect(url_for('buyer_dashboard'))
-        else:
+        if not check_password_hash(user.password, password):
             flash('Invalid password.', 'danger')
             return redirect(url_for('login'))
+
+        if not user.email_verified:
+            flash('Please verify your email before logging in.', 'warning')
+            return redirect(url_for('login'))
+
+        # Set session
+        session['user_id'] = user.id
+        session['user_type'] = user.user_type
+        flash('Login successful!', 'success')
+
+        # Redirect based on role
+        if user.user_type == 'admin':
+            return redirect(url_for('admin_dashboard'))
+        elif user.user_type == 'seller':
+            return redirect(url_for('seller_dashboard'))
+        else:
+            return redirect(url_for('buyer_dashboard'))
 
     return render_template('login.html')
 
@@ -460,6 +519,220 @@ def delete_product(product_id):
     db.session.commit()
     flash('Product deleted successfully', 'success')
     return redirect(url_for('seller_dashboard'))
+
+# In app.py, add these new routes
+
+# Admin Dashboard
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    if 'user_id' not in session or session.get('user_type') != 'admin':
+        abort(403)
+    
+    # Get all users
+    users = User.query.order_by(User.created_at.desc()).all()
+    
+    # Get sellers whose subscription is ending in 5 days
+    ending_soon = []
+    for user in users:
+        if user.user_type == 'seller' and user.subscription_end:
+            days_left = (user.subscription_end - datetime.now()).days
+            if 0 < days_left <= 5:
+                ending_soon.append(user)
+    
+    return render_template('admin_dashboard.html', users=users, ending_soon=ending_soon)
+
+# Admin - View User Details
+@app.route('/admin/user/<int:user_id>')
+def admin_view_user(user_id):
+    if 'user_id' not in session or session.get('user_type') != 'admin':
+        abort(403)
+    
+    user = User.query.get_or_404(user_id)
+    products = []
+    
+    if user.user_type == 'seller':
+        products = Product.query.filter_by(seller_id=user.id).all()
+    
+    return render_template('admin_user_detail.html', user=user, products=products)
+
+# Admin - Delete User
+@app.route('/admin/user/delete/<int:user_id>', methods=['POST'])
+def admin_delete_user(user_id):
+    if 'user_id' not in session or session.get('user_type') != 'admin':
+        abort(403)
+    
+    user = User.query.get_or_404(user_id)
+    
+    # Delete user's products if they're a seller
+    if user.user_type == 'seller':
+        Product.query.filter_by(seller_id=user.id).delete()
+    
+    db.session.delete(user)
+    db.session.commit()
+    
+    flash(f'User {user.username} has been deleted.', 'success')
+    return redirect(url_for('admin_dashboard'))
+
+# Admin - Manage Seller Subscription
+@app.route('/admin/seller/activate/<int:user_id>', methods=['POST'])
+def admin_activate_seller(user_id):
+    if 'user_id' not in session or session.get('user_type') != 'admin':
+        abort(403)
+    
+    seller = User.query.get_or_404(user_id)
+    if seller.user_type != 'seller':
+        abort(400)
+    
+    days = int(request.form.get('days', 0))
+    
+    if days <= 0:
+        flash('Invalid subscription period', 'danger')
+        return redirect(url_for('admin_view_user', user_id=user_id))
+    
+    now = datetime.now()
+    seller.subscription_start = now
+    seller.subscription_end = now + timedelta(days=days)
+    seller.is_seller_active = True
+    seller.last_payment_proof = request.form.get('payment_proof', '')
+    
+    db.session.commit()
+    
+    # Send notification to seller
+    msg = Message('Your Subscription Has Been Activated', recipients=[seller.email])
+    msg.body = f'''Hello {seller.username},
+    
+Your subscription has been activated for {days} days. You can now publish your products on Burundian Market.
+
+Thank you for using our service!
+'''
+    mail.send(msg)
+    
+    flash('Seller subscription activated successfully!', 'success')
+    return redirect(url_for('admin_view_user', user_id=user_id))
+
+# Admin - Send Message to User
+@app.route('/admin/user/message/<int:user_id>', methods=['GET', 'POST'])
+def admin_send_message(user_id):
+    if 'user_id' not in session or session.get('user_type') != 'admin':
+        abort(403)
+    
+    user = User.query.get_or_404(user_id)
+    
+    if request.method == 'POST':
+        subject = request.form.get('subject', 'Message from Burundian Market Admin')
+        message = request.form.get('message', '')
+        
+        if not message:
+            flash('Message cannot be empty', 'danger')
+            return redirect(url_for('admin_send_message', user_id=user_id))
+        
+        # Send email
+        msg = Message(subject, recipients=[user.email])
+        msg.body = message
+        mail.send(msg)
+        
+        # Optionally send SMS if phone number exists
+        # You would need to implement SMS functionality here
+        
+        flash('Message sent successfully!', 'success')
+        return redirect(url_for('admin_view_user', user_id=user_id))
+    
+    return render_template('admin_send_message.html', user=user)
+
+# In app.py, add these routes
+
+# Seller Subscription Page
+@app.route('/seller/subscribe')
+def seller_subscribe():
+    if 'user_id' not in session or session.get('user_type') != 'seller':
+        return redirect(url_for('login'))
+    
+    user = User.query.get(session['user_id'])
+    return render_template('seller_subscribe.html', user=user)
+
+# Process Subscription Choice
+@app.route('/seller/choose-subscription', methods=['POST'])
+def choose_subscription():
+    if 'user_id' not in session or session.get('user_type') != 'seller':
+        return redirect(url_for('login'))
+    
+    period = request.form.get('period')
+    periods = {
+        '30': 15000,
+        '60': 30000,
+        '120': 60000,
+        '180': 75000,
+        '250': 90000,
+        '300': 120000,
+        '365': 155000
+    }
+    
+    if period not in periods:
+        flash('Invalid subscription period selected', 'danger')
+        return redirect(url_for('seller_subscribe'))
+    
+    return render_template('subscription_payment.html', 
+                         period=period,
+                         amount=periods[period],
+                         days=period)
+
+# Middleware to check seller subscription status
+@app.before_request
+def check_seller_subscription():
+    if 'user_id' in session and session.get('user_type') == 'seller':
+        user = User.query.get(session['user_id'])
+        
+        # If seller's trial period is over (5 days)
+        if user.is_seller_active and user.subscription_end is None:
+            trial_end = user.created_at + timedelta(days=5)
+            if datetime.now() > trial_end:
+                user.is_seller_active = False
+                db.session.commit()
+                
+                # Notify seller
+                msg = Message('Your Trial Period Has Ended', recipients=[user.email])
+                msg.body = f'''Hello {user.username},
+                
+Your 5-day trial period has ended. To continue publishing products, please subscribe to one of our plans.
+
+Thank you for using Burundian Market!
+'''
+                mail.send(msg)
+                
+                # Notify admin
+                msg = Message('Seller Trial Period Ended', recipients=['mugishapc1@gmail.com'])
+                msg.body = f'''Admin,
+                
+Seller {user.username} (ID: {user.id}) has ended their trial period and needs to subscribe.
+'''
+                mail.send(msg)
+        
+        # If subscription is ending in 5 days
+        elif user.is_seller_active and user.subscription_end:
+            days_left = (user.subscription_end - datetime.now()).days
+            if days_left == 5:
+                # Notify seller
+                msg = Message('Your Subscription is Ending Soon', recipients=[user.email])
+                msg.body = f'''Hello {user.username},
+                
+Your subscription will end in 5 days. Please renew to avoid service interruption.
+
+Thank you for using Burundian Market!
+'''
+                mail.send(msg)
+                
+                # Notify admin
+                msg = Message('Seller Subscription Ending Soon', recipients=['mugishapc1@gmail.com'])
+                msg.body = f'''Admin,
+                
+Seller {user.username} (ID: {user.id}) has only 5 days left in their subscription.
+'''
+                mail.send(msg)
+        
+        # Redirect to subscription page if not active
+        if not user.is_seller_active and request.endpoint not in ['seller_subscribe', 'choose_subscription', 'logout']:
+            flash('Your seller account is not active. Please subscribe to continue.', 'warning')
+            return redirect(url_for('seller_subscribe'))
 
 if __name__ == '__main__':
     app.run(debug=True)
